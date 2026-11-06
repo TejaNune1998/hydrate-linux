@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# hydrate {tick|daemon|alert|log|undo|reset|set K N|state|status|waybar|panel|stats|pause|resume}
+set -u
+conf="$HOME/.config/hydrate/config"
+st="${XDG_STATE_HOME:-$HOME/.local/state}/hydrate"
+GOAL_ML=2500; GLASS_ML=250; INTERVAL=45; START_HOUR=8; END_HOUR=22; PAUSED=0; ALERT_STYLE=auto
+load() { [[ -f "$conf" ]] && source "$conf"; }
+load
+mkdir -p "$st"
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+if [[ -z "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
+  for s in "$XDG_RUNTIME_DIR"/wayland-[0-9]*; do
+    [[ -S "$s" ]] && { export WAYLAND_DISPLAY="${s##*/}"; break; }
+  done
+  [[ -z "${WAYLAND_DISPLAY:-}" ]] && export DISPLAY=:0
+fi
+
+today="$st/$(date +%F).ml"
+next="$st/next_due"
+
+count()  { cat "$today" 2>/dev/null || echo 0; }
+litres() { awk -v m="$1" 'BEGIN{printf "%g", m/1000}'; }
+clock()  { date -d "@$1" +"%-I:%M %p"; }
+hour12() { local h=$((10#$1 % 24)); echo "$((h % 12 ? h % 12 : 12)):00 $( ((h < 12)) && echo AM || echo PM )"; }
+to24()   { local h=$((10#${1%%:*} % 12)); [[ "$1" == *PM* ]] && h=$((h + 12)); echo "$h"; }
+bar()    { pkill -RTMIN+14 waybar 2>/dev/null || true; date +%s%N > "$st/changed" 2>/dev/null || true; }
+sched()  { echo $(( $(date +%s) + ${1:-$INTERVAL} * 60 )) > "$next"; }
+setc()   { touch "$conf"; if grep -q "^$1=" "$conf"; then sed -i "s/^$1=.*/$1=$2/" "$conf"; else echo "$1=$2" >> "$conf"; fi; }
+
+log() {
+  local b c
+  b=$(count); c=$((b + GLASS_ML))
+  echo "$c" > "$today"; sched; bar
+  if (( c >= GOAL_ML && b < GOAL_ML )); then
+    notify-send -a Hydrate "Goal reached 🎉" "$(litres "$c") / $(litres "$GOAL_ML") L today" 2>/dev/null || true
+  fi
+}
+
+undo() {
+  local c=$(( $(count) - GLASS_ML ))
+  echo $(( c < 0 ? 0 : c )) > "$today"; bar
+}
+
+toggle() {
+  if (( PAUSED == 1 )); then setc PAUSED 0; sched; else setc PAUSED 1; fi
+  bar
+}
+
+cfg() {
+  local key="${1:-}" val="${2:-}"
+  [[ "$val" =~ ^[0-9]+$ ]] || { echo "number needed"; exit 1; }
+  case "$key" in
+    interval) setc INTERVAL "$val"; sched "$val" ;;
+    start)    setc START_HOUR "$val" ;;
+    end)      setc END_HOUR "$val" ;;
+    goal)     setc GOAL_ML "$val" ;;
+    glass)    setc GLASS_ML "$val" ;;
+    *) echo "usage: hydrate set {interval|start|end|goal|glass} N"; exit 1 ;;
+  esac
+  bar
+}
+
+alert() {
+  local msg style="$ALERT_STYLE" out
+  msg="$(litres "$(count)") / $(litres "$GOAL_ML") L today"
+  if [[ "$style" == auto ]]; then
+    style=dialog
+    if { ! command -v busctl >/dev/null || busctl --user status org.freedesktop.Notifications >/dev/null 2>&1; } &&
+       notify-send --help 2>&1 | grep -q -- --action; then style=notify; fi
+  fi
+  if [[ "$style" == notify ]]; then
+    read -r out < <(notify-send -a Hydrate -u critical -t 0 --wait --action="default=I drank water"           "🥤 Time to drink water" "$msg. Click to log ${GLASS_ML} ml")
+  elif command -v yad >/dev/null 2>&1; then
+    yad --title="Hydrate" --class=hydrate --on-top --sticky --skip-taskbar --center --borders=18         --text-align=center --text="<big><b>🥤 Time to drink water</b></big>\n\n$msg"         --button="I drank water (${GLASS_ML} ml):0" --button="Snooze 10 min:1" && out=default
+  else
+    notify-send -u critical "🥤 Time to drink water" "$msg" 2>/dev/null || true
+  fi
+  if [[ "${out:-}" == *default* ]]; then log; else sched 10; bar; fi
+}
+
+tick() {
+  exec 9>"$st/lock"; flock -n 9 || exit 0
+  (( PAUSED == 1 )) && exit 0
+  local h=$((10#$(date +%H)))
+  (( h < START_HOUR || h >= END_HOUR )) && exit 0
+  (( $(count) >= GOAL_ML )) && exit 0
+  [[ -f "$next" ]] || { sched; exit 0; }
+  (( $(date +%s) >= $(cat "$next") )) && alert
+}
+
+state() {
+  local w="" i
+  for i in 6 5 4 3 2 1; do
+    w+="${w:+,}$(cat "$st/$(date -d "-$i day" +%F).ml" 2>/dev/null || echo 0)"
+  done
+  printf '{"ml":%s,"goal":%s,"glass":%s,"interval":%s,"start":%s,"end":%s,"paused":%s,"next":"%s","week":[%s]}\n'     "$(count)" "$GOAL_ML" "$GLASS_ML" "$INTERVAL" "$((10#$START_HOUR))" "$((10#$END_HOUR))" "$PAUSED" "$([[ -f "$next" ]] && clock "$(cat "$next")")" "$w"
+}
+
+wb() {
+  local ml pct cls="low" txt tip
+  ml=$(count)
+  pct=$(( GOAL_ML > 0 ? ml * 100 / GOAL_ML : 0 )); (( pct > 100 )) && pct=100
+  (( pct >= 50 )) && cls="mid"
+  (( pct >= 100 )) && cls="done"
+  (( PAUSED == 1 )) && cls="paused"
+  txt="🥤 $(litres "$ml")/$(litres "$GOAL_ML") L"; (( PAUSED == 1 )) && txt+=" ⏸"
+  tip="Water today: $(litres "$ml") of $(litres "$GOAL_ML") L"
+  [[ -f "$next" ]] && tip+="\nNext reminder: $(clock "$(cat "$next")")"
+  tip+="\nEvery $INTERVAL min, $(hour12 "$START_HOUR") to $(hour12 "$END_HOUR")"
+  printf '{"text":"%s","tooltip":"%s","class":"%s","percentage":%s}\n' "$txt" "$tip" "$cls" "$pct"
+}
+
+stats() {
+  local f
+  for f in $(ls "$st" 2>/dev/null | grep -E '^[0-9-]{10}\.ml$' | tail -7); do
+    printf '%s  %s / %s L\n' "$(date -d "${f%.ml}" +'%a %d %b')" "$(litres "$(cat "$st/$f")")" "$(litres "$GOAL_ML")"
+  done
+}
+
+opts() {
+  local cur="$1" f="$2" out="" v; shift 2
+  [[ " $* " == *" $cur "* ]] || set -- "$@" "$cur"
+  for v; do
+    [[ "$v" == "$cur" ]] && out+="^"
+    out+="$($f "$v")!"
+  done
+  echo "${out%!}"
+}
+
+yadpanel() {
+  local ml pct bar i t out rc iv s e gl g
+  while :; do
+    load
+    ml=$(count)
+    pct=$(( GOAL_ML > 0 ? ml * 100 / GOAL_ML : 0 )); (( pct > 100 )) && pct=100
+    bar=""; for i in 0 1 2 3 4 5 6 7 8 9; do (( i < pct / 10 )) && bar+="▰" || bar+="▱"; done
+    t="Reminders on"
+    [[ -f "$next" ]] && t="Next reminder $(clock "$(cat "$next")")"
+    (( PAUSED == 1 )) && t="Paused"
+    (( ml >= GOAL_ML )) && t="Goal reached"
+    out=$(yad --title="Hydrate" --class=hydrate --name=hydrate --on-top --skip-taskbar --fixed         --width=360 --borders=16 --text-align=center         --text="<span size='xx-large'><b>$(litres "$ml") L</b></span>\n<span alpha='70%'>of $(litres "$GOAL_ML") L  ·  $pct%</span>\n\n<span size='large'>$bar</span>\n<span alpha='70%'>$t</span>"         --form --columns=1         --field="Remind every (min):CB" "$(opts "$INTERVAL" echo 15 20 30 45 60 90)"         --field="Start at:CB"           "$(opts "$((10#$START_HOUR))" hour12 5 6 7 8 9 10 11)"         --field="Stop at:CB"            "$(opts "$((10#$END_HOUR))" hour12 17 18 19 20 21 22 23)"         --field="Glass size (ml):CB"    "$(opts "$GLASS_ML" echo 200 250 300 500)"         --field="Daily goal (L):CB"     "$(opts "$GOAL_ML" litres 1500 2000 2500 3000 3500 4000)"         --button="+ ${GLASS_ML} ml:10" --button="Undo:11"         --button="$( (( PAUSED == 1 )) && echo "Resume" || echo "Pause" ):12"         --button="Save:0" --button="Close:1")
+    rc=$?
+    case $rc in
+      10) log ;;
+      11) undo ;;
+      12) toggle ;;
+      0)  IFS='|' read -r iv s e gl g _ <<< "$out"
+          [[ -n "$iv" ]] || break
+          s=$(to24 "$s"); e=$(to24 "$e"); g=$(awk -v g="$g" 'BEGIN{printf "%d", g * 1000}')
+          [[ "$iv" != "$INTERVAL" ]]          && cfg interval "$iv"
+          [[ "$s"  != "$((10#$START_HOUR))" ]] && cfg start "$s"
+          [[ "$e"  != "$((10#$END_HOUR))" ]]   && cfg end "$e"
+          [[ "$gl" != "$GLASS_ML" ]]          && cfg glass "$gl"
+          [[ "$g"  != "$GOAL_ML" ]]           && cfg goal "$g"
+          break ;;
+      *)  break ;;
+    esac
+  done
+}
+
+pick() {
+  local m
+  for m in "walker --dmenu -p" "fuzzel --dmenu -p" "wofi --dmenu -p" "rofi -dmenu -p" "bemenu -p" "tofi --prompt-text" "dmenu -p"; do
+    command -v ${m%% *} >/dev/null && { $m "$1"; return; }
+  done
+  notify-send Hydrate "install yad, or rofi/wofi/fuzzel"
+  return 1
+}
+
+menu() {
+  local c v
+  c=$(printf '%s\n' "Log ${GLASS_ML} ml ($(litres "$(count)") / $(litres "$GOAL_ML") L)" "Undo" "Interval (${INTERVAL} min)"       "Start ($(hour12 "$START_HOUR"))" "Stop ($(hour12 "$END_HOUR"))" "Glass size (${GLASS_ML} ml)"       "Daily goal ($(litres "$GOAL_ML") L)" "Pause / resume" "Last 7 days" "Test alert" | pick "Hydrate") || return 0
+  case "$c" in
+    Log*)      log ;;
+    Undo)      undo ;;
+    Interval*) v=$(printf '%s\n' 15 20 30 45 60 90 | pick "Every (min)") && cfg interval "$v" ;;
+    Start*)    v=$(for h in 5 6 7 8 9 10 11; do hour12 "$h"; done | pick "Start") && cfg start "$(to24 "$v")" ;;
+    Stop*)     v=$(for h in 17 18 19 20 21 22 23; do hour12 "$h"; done | pick "Stop") && cfg end "$(to24 "$v")" ;;
+    Glass*)    v=$(printf '%s\n' 200 250 300 500 | pick "Glass (ml)") && cfg glass "$v" ;;
+    Daily*)    v=$(printf '%s\n' 1.5 2 2.5 3 3.5 4 | pick "Goal (L)") && cfg goal "$(awk -v g="$v" 'BEGIN{printf "%d", g * 1000}')" ;;
+    Pause*)    toggle ;;
+    Last*)     notify-send Hydrate "$(stats)" ;;
+    Test*)     alert ;;
+  esac
+}
+
+panel() {
+  if command -v omarchy-shell >/dev/null 2>&1 && [[ -d "$HOME/.config/omarchy/plugins/hydrate" ]]; then
+    omarchy-shell shell summon hydrate '{}' >/dev/null 2>&1 && return 0
+  fi
+  if command -v yad >/dev/null 2>&1; then yadpanel; else menu; fi
+}
+
+case "${1:-status}" in
+  tick)       tick; exit 0 ;;
+  daemon)     while sleep 60; do "$0" tick; done ;;
+  alert)      alert ;;
+  log)        log ;;
+  undo)       undo ;;
+  reset)      echo 0 > "$today"; bar ;;
+  set)        cfg "${2:-}" "${3:-}" ;;
+  state)      state ;;
+  waybar)     wb ;;
+  status)     echo "🥤 $(litres "$(count)")/$(litres "$GOAL_ML") L" ;;
+  panel|menu) panel ;;
+  stats)      stats ;;
+  pause)      setc PAUSED 1; bar ;;
+  resume)     setc PAUSED 0; sched; bar ;;
+  *) echo "usage: hydrate {tick|daemon|alert|log|undo|reset|set|state|status|waybar|panel|stats|pause|resume}"; exit 1 ;;
+esac

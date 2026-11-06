@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "hydrate",
+  "name": "Hydrate",
+  "version": "6.0.0",
+  "author": "teja",
+  "license": "MIT",
+  "description": "Water tracker and reminder",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "Hydrate",
+    "category": "Health",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
