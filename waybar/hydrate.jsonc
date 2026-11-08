@@ -1,0 +1,11 @@
+{
+  "custom/hydrate": {
+    "exec": "$HOME/.local/bin/hydrate waybar",
+    "return-type": "json",
+    "interval": 30,
+    "signal": 14,
+    "on-click": "$HOME/.local/bin/hydrate panel",
+    "on-click-right": "$HOME/.local/bin/hydrate log",
+    "tooltip": true
+  }
+}

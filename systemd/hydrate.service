@@ -1,0 +1,7 @@
+[Unit]
+Description=Water reminder check
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+ExecStart=%h/.local/bin/hydrate tick
