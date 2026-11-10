@@ -157,6 +157,10 @@ do_install() {
 
   # 1. CLI
   install -Dm755 "$ROOT/bin/hydrate" "$BIN/hydrate"
+  # remember where this came from, so `hydrate update` can pull and reinstall with the same options
+  mkdir -p "$CDIR"
+  echo "$ROOT" > "$CDIR/source"
+  echo "$*" > "$CDIR/install-flags"
 
   # 2. config defaults (existing values are kept)
   # gnome-like shells drop notifications after a few seconds: use a dialog there
@@ -165,7 +169,7 @@ do_install() {
       command -v yad >/dev/null 2>&1 && def=dialog ;;
   esac
   touch "$CDIR/config"
-  for kv in GOAL_ML=2500 GLASS_ML=250 INTERVAL=45 START_HOUR=8 START_MINUTE=0 END_HOUR=22 END_MINUTE=0 PAUSED=0 DAYS=all "ALERT_STYLE=$def"; do
+  for kv in GOAL_ML=2500 GLASS_ML=250 INTERVAL=45 START_HOUR=8 START_MINUTE=0 END_HOUR=22 END_MINUTE=0 PAUSED=0 DAYS=all SNOOZE_MIN=10 SKIP_LOCKED=1 SKIP_DND=1 SKIP_FULLSCREEN=1 SKIP_IDLE_MIN=0 "ALERT_STYLE=$def"; do
     grep -q "^${kv%%=*}=" "$CDIR/config" || echo "$kv" >> "$CDIR/config"
   done
   # shellcheck disable=SC1091
@@ -205,7 +209,7 @@ do_install() {
   [[ "$wbf" == 1 ]] && { waybar_install; w=1; }
 
   echo "Hydrate installed. bars:$([[ $q == 1 ]] && echo ' quickshell')$([[ $w == 1 ]] && echo ' waybar')$([[ $q$w == 00 ]] && echo ' none (use: hydrate status, or the app launcher)')"
-  echo "try: hydrate panel | hydrate alert | hydrate doctor      remove: hydrate uninstall | hydrate purge"
+  echo "try: hydrate panel | hydrate alert | hydrate doctor      update: hydrate update      remove: hydrate uninstall"
 }
 
 case "${1:-install}" in

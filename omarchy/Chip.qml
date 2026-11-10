@@ -8,12 +8,13 @@ Rectangle {
   property bool selected: false
   property bool accentFill: false
   property string hint: ""
+  property bool compact: false
   property string fontFamily: Style.font.family
   readonly property bool filled: selected || accentFill
   signal clicked()
 
-  implicitWidth: row.implicitWidth + Style.space(20)
-  implicitHeight: row.implicitHeight + Style.space(12)
+  implicitWidth: row.implicitWidth + Style.space(compact ? 10 : 20)
+  implicitHeight: row.implicitHeight + Style.space(compact ? 6 : 12)
   radius: Style.cornerRadius
   color: filled ? Commons.Color.accent : Qt.alpha(Commons.Color.foreground, mouse.containsMouse ? 0.18 : 0.08)
 

@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
-# hydrate {tick|daemon|alert|log|undo|reset|set|state|status|waybar|panel|stats|pause|resume|doctor|uninstall|purge}
+# hydrate {tick|daemon|alert|log|undo|reset|set|state|status|waybar|panel|stats|week|entries|schedule|
+#          export|backup|restore|pause|resume|update|version|doctor|uninstall|purge}
 set -u
 conf="$HOME/.config/hydrate/config"
 st="${XDG_STATE_HOME:-$HOME/.local/state}/hydrate"
 GOAL_ML=2500; GLASS_ML=250; INTERVAL=45; START_HOUR=8; START_MINUTE=0; END_HOUR=22; END_MINUTE=0; PAUSED=0; ALERT_STYLE=auto; DAYS=all
+VERSION=6.6.0
+SNOOZE_MIN=10; QUIET=""; SKIP_LOCKED=1; SKIP_DND=1; SKIP_FULLSCREEN=1; SKIP_IDLE_MIN=0
+DAY_MON=""; DAY_TUE=""; DAY_WED=""; DAY_THU=""; DAY_FRI=""; DAY_SAT=""; DAY_SUN=""
+DAYKEYS=(mon tue wed thu fri sat sun)
 load() { [[ -f "$conf" ]] && source "$conf"; }
 load
 mkdir -p "$st"
@@ -19,6 +24,7 @@ fi
 
 today="$st/$(date +%F).ml"
 next="$st/next_due"
+entries="$st/$(date +%F).log"
 
 count()  { cat "$today" 2>/dev/null || echo 0; }
 litres() { awk -v m="$1" 'BEGIN{printf "%g", m/1000}'; }
@@ -33,44 +39,161 @@ bar()    { pkill -RTMIN+14 waybar 2>/dev/null || true; date +%s%N > "$st/changed
 sched()  { echo $(( $(date +%s) + ${1:-$INTERVAL} * 60 )) > "$next"; }
 setc()   { touch "$conf"; if grep -q "^$1=" "$conf"; then sed -i "s/^$1=.*/$1=$2/" "$conf"; else echo "$1=$2" >> "$conf"; fi; }
 
-# reminders are off on sat/sun when DAYS=weekdays
-weekday_off() { [[ "$DAYS" == weekdays ]] && (( $(date +%u) >= 6 )); }
+# alert clicks and bar clicks can race: serialize read-modify-write of the day's files
+locked() { ( flock 8; "$@" ) 8>"$st/data.lock"; }
 
-# ml for each day of the current week, mon..sun (-1 = day hasn't happened yet)
+hm_to_min()   { local h="${1%%:*}" m="${1##*:}"; echo $(( 10#$h * 60 + 10#$m )); }
+valid_range() { [[ "$1" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]-([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]]; }
+day_index() {
+  case "${1,,}" in
+    mon|monday) echo 0 ;; tue|tuesday) echo 1 ;; wed|wednesday) echo 2 ;; thu|thursday) echo 3 ;;
+    fri|friday) echo 4 ;; sat|saturday) echo 5 ;; sun|sunday) echo 6 ;; *) return 1 ;;
+  esac
+}
+
+# reminder window for a weekday (0=mon, default today) as "start_min end_min", or "off"
+day_window() {
+  local idx="${1:-$(( $(date +%u) - 1 ))}" key v
+  key="DAY_${DAYKEYS[$idx]^^}"; v="${!key:-}"
+  if [[ "$v" == off ]]; then echo off; return; fi
+  if [[ -n "$v" ]] && valid_range "$v"; then
+    echo "$(hm_to_min "${v%-*}") $(hm_to_min "${v#*-}")"; return
+  fi
+  if [[ "$DAYS" == weekdays ]] && (( idx >= 5 )); then echo off; return; fi
+  echo "$((10#$START_HOUR * 60 + 10#${START_MINUTE:-0})) $((10#$END_HOUR * 60 + 10#${END_MINUTE:-0}))"
+}
+weekday_off() { [[ "$(day_window)" == off ]]; }
+
+# QUIET="12:00-13:00,15:00-15:30": no reminders inside these windows
+in_quiet() {
+  local now="$1" part s e parts
+  [[ -n "${QUIET:-}" ]] || return 1
+  IFS=, read -ra parts <<< "$QUIET"
+  for part in "${parts[@]}"; do
+    valid_range "$part" || continue
+    s=$(hm_to_min "${part%-*}"); e=$(hm_to_min "${part#*-}")
+    if (( s <= e )); then (( now >= s && now < e )) && return 0
+    else (( now >= s || now < e )) && return 0; fi
+  done
+  return 1
+}
+
+# ---- reasons to hold a due reminder back (it fires as soon as the reason goes away)
+is_locked() {
+  [[ "$SKIP_LOCKED" == 1 ]] || return 1
+  [[ "$(loginctl show-session "${XDG_SESSION_ID:-self}" -p LockedHint --value 2>/dev/null)" == yes ]] && return 0
+  pgrep -x 'hyprlock|swaylock|swaylock-effects|i3lock|i3lock-color|gtklock|waylock|slock|xsecurelock|kscreenlocker_greet|gnome-screensaver|cinnamon-screensaver|mate-screensaver|xscreensaver' >/dev/null 2>&1
+}
+is_dnd() {
+  [[ "$SKIP_DND" == 1 ]] || return 1
+  if command -v makoctl >/dev/null 2>&1 && makoctl mode 2>/dev/null | grep -qiE '^(do-not-disturb|dnd|silent|silence)$'; then return 0; fi
+  if command -v dunstctl >/dev/null 2>&1 && [[ "$(dunstctl is-paused 2>/dev/null)" == true ]]; then return 0; fi
+  if command -v swaync-client >/dev/null 2>&1 && [[ "$(swaync-client -D 2>/dev/null)" == true ]]; then return 0; fi
+  if command -v gsettings >/dev/null 2>&1 && [[ "$(gsettings get org.gnome.desktop.notifications show-banners 2>/dev/null)" == false ]]; then return 0; fi
+  return 1
+}
+is_fullscreen() {
+  [[ "$SKIP_FULLSCREEN" == 1 ]] || return 1
+  local sig fs id
+  if command -v hyprctl >/dev/null 2>&1; then
+    sig="${HYPRLAND_INSTANCE_SIGNATURE:-$(ls -t "$XDG_RUNTIME_DIR/hypr" 2>/dev/null | head -1)}"
+    if [[ -n "$sig" ]]; then
+      fs=$(HYPRLAND_INSTANCE_SIGNATURE="$sig" hyprctl activewindow -j 2>/dev/null | jq -r '.fullscreen | tostring' 2>/dev/null)
+      [[ "$fs" == true || "$fs" == 2 || "$fs" == 3 ]] && return 0
+    fi
+  fi
+  if command -v swaymsg >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    swaymsg -t get_tree 2>/dev/null | jq -e '[.. | objects | select(.focused == true)] | .[0].fullscreen_mode == 1' >/dev/null 2>&1 && return 0
+  fi
+  if command -v xprop >/dev/null 2>&1 && [[ -n "${DISPLAY:-}" ]]; then
+    id=$(xprop -root _NET_ACTIVE_WINDOW 2>/dev/null | awk '{print $NF}')
+    [[ -n "$id" && "$id" != 0x0 ]] && xprop -id "$id" _NET_WM_STATE 2>/dev/null | grep -q _NET_WM_STATE_FULLSCREEN && return 0
+  fi
+  return 1
+}
+# idle: xprintidle on X11, otherwise the logind IdleHint (set by GNOME/KDE and some others)
+is_idle() {
+  (( SKIP_IDLE_MIN > 0 )) || return 1
+  if command -v xprintidle >/dev/null 2>&1 && [[ -n "${DISPLAY:-}" ]]; then
+    (( $(xprintidle 2>/dev/null || echo 0) >= SKIP_IDLE_MIN * 60000 )); return
+  fi
+  [[ "$(loginctl show-session "${XDG_SESSION_ID:-self}" -p IdleHint --value 2>/dev/null)" == yes ]]
+}
+skip_reason() {
+  is_locked     && { echo "screen locked"; return 0; }
+  is_dnd        && { echo "do not disturb"; return 0; }
+  is_fullscreen && { echo "fullscreen app"; return 0; }
+  is_idle       && { echo "idle"; return 0; }
+  return 1
+}
+
+# ---- weeks (monday first). back=0 is the current week, 1 last week, ...
+# ml for each day mon..sun of that week; -1 = day hasn't happened yet
 week_vals() {
-  local off=$(( $(date +%u) - 1 )) i v w=""
+  local back="${1:-0}" dow=$(( $(date +%u) - 1 )) i v w="" ago
   for i in 0 1 2 3 4 5 6; do
-    if (( i > off )); then v=-1
-    else v=$(cat "$st/$(date -d "-$((off - i)) day" +%F).ml" 2>/dev/null || echo 0); fi
+    ago=$(( dow - i + back * 7 ))
+    if (( ago < 0 )); then v=-1
+    else v=$(cat "$st/$(date -d "-$ago day" +%F).ml" 2>/dev/null || echo 0); fi
     w+="${w:+,}$v"
   done
   echo "$w"
 }
-
-# average ml per tracked day last week (mon-fri when DAYS=weekdays), -1 if nothing tracked
-prev_avg() {
-  local off=$(( $(date +%u) - 1 )) n=7 i v sum=0 cnt=0
-  [[ "$DAYS" == weekdays ]] && n=5
-  for (( i = 0; i < n; i++ )); do
-    v=$(cat "$st/$(date -d "-$((off + 7 - i)) day" +%F).ml" 2>/dev/null || echo 0)
-    (( v > 0 )) && { sum=$(( sum + v )); cnt=$(( cnt + 1 )); }
-  done
+week_start() { date -d "-$(( $(date +%u) - 1 + ${1:-0} * 7 )) day" +%F; }
+# average ml over the days of that week that have something logged; -1 if none
+week_avg() {
+  local vals v sum=0 cnt=0
+  IFS=, read -ra vals <<< "$(week_vals "${1:-0}")"
+  for v in "${vals[@]}"; do (( v > 0 )) && { sum=$(( sum + v )); cnt=$(( cnt + 1 )); }; done
   if (( cnt > 0 )); then echo $(( sum / cnt )); else echo -1; fi
+}
+prev_avg() { week_avg 1; }
+# how many weeks back the oldest recorded day is (0 when there is no history)
+max_back() {
+  local f d n back dow=$(( $(date +%u) - 1 ))
+  f=$(ls "$st" 2>/dev/null | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}\.ml$' | head -1)
+  [[ -n "$f" ]] || { echo 0; return; }
+  d="${f%.ml}"
+  n=$(( ( $(date -d "$(date +%F)" +%s) - $(date -d "$d" +%s) ) / 86400 ))
+  back=$(( (n - dow + 6) / 7 )); (( back < 0 )) && back=0
+  echo "$back"
+}
+
+log_entry() {
+  local amt="$1" b c
+  b=$(count); c=$((b + amt))
+  echo "$c" > "$today"
+  printf '%s\t%s\n' "$(date +%s)" "$amt" >> "$entries"
+  echo "$b $c"
 }
 
 log() {
-  local b c
-  b=$(count); c=$((b + GLASS_ML))
-  echo "$c" > "$today"; sched; bar
+  local amt="${1:-$GLASS_ML}" b c
+  if ! [[ "$amt" =~ ^[0-9]+$ ]] || (( amt < 1 || amt > 3000 )); then
+    echo "usage: hydrate log [ML]   (1 to 3000 ml, default one glass)"; return 1
+  fi
+  read -r b c <<< "$(locked log_entry "$amt")"
+  sched; bar
   if (( c >= GOAL_ML && b < GOAL_ML )); then
     notify-send -a Hydrate "Goal reached 🎉" "$(litres "$c") / $(litres "$GOAL_ML") L today" 2>/dev/null || true
   fi
 }
 
-undo() {
-  local c=$(( $(count) - GLASS_ML ))
-  echo $(( c < 0 ? 0 : c )) > "$today"; bar
+# takes back the most recent entry (what was really logged, not the current glass size)
+undo_entry() {
+  local last amt="" c
+  c=$(count)
+  if [[ -s "$entries" ]]; then
+    last=$(tail -n 1 "$entries"); amt="${last##*$'\t'}"
+    sed -i '$d' "$entries"
+    [[ -s "$entries" ]] || rm -f "$entries"
+  fi
+  [[ "$amt" =~ ^[0-9]+$ ]] || amt="$GLASS_ML"
+  c=$(( c - amt )); (( c < 0 )) && c=0
+  echo "$c" > "$today"
 }
+undo() { locked undo_entry; bar; }
+reset_day() { echo 0 > "$today"; rm -f "$entries"; }
 
 toggle() {
   if (( PAUSED == 1 )); then setc PAUSED 0; sched; else setc PAUSED 1; fi
@@ -78,32 +201,70 @@ toggle() {
 }
 
 cfg() {
-  local key="${1:-}" val="${2:-}"
-  if [[ "$key" == days ]]; then
-    [[ "$val" == all || "$val" == weekdays ]] || { echo "usage: hydrate set days all|weekdays"; exit 1; }
-    setc DAYS "$val"; bar; return
-  fi
-  [[ "$val" =~ ^[0-9]+$ ]] || { echo "number needed"; exit 1; }
+  local key="${1:-}" val="${2:-}" val2="${3:-}" n v s e part parts
   case "$key" in
-    interval)
-      case "$val" in 30|45|60) setc INTERVAL "$val"; sched "$val" ;;
-        *) echo "interval must be 30, 45, or 60 minutes"; exit 1 ;;
-      esac ;;
-    start)    setc START_HOUR "$val" ;;
-    end)      setc END_HOUR "$val" ;;
-    start_minute|end_minute)
-      [[ "$val" == 0 || "$val" == 15 || "$val" == 30 || "$val" == 45 ]] || { echo "minutes must be 0, 15, 30, or 45"; exit 1; }
-      [[ "$key" == start_minute ]] && setc START_MINUTE "$val" || setc END_MINUTE "$val" ;;
-    goal)
-      case "$val" in 2000|2500|3000|3500|4000|4500|5000|5500|6000) setc GOAL_ML "$val" ;;
-        *) echo "daily goal must be between 2 and 6 litres (2000 through 6000 ml in 500 ml steps)"; exit 1 ;;
-      esac ;;
-    glass)
+    days)
+      [[ "$val" == all || "$val" == weekdays ]] || { echo "usage: hydrate set days all|weekdays"; return 1; }
+      setc DAYS "$val" ;;
+    day)
+      n=$(day_index "$val") || { echo "usage: hydrate set day mon..sun off|default|HH:MM-HH:MM"; return 1; }
+      key="DAY_${DAYKEYS[$n]^^}"
+      if [[ "$val2" == default ]]; then
+        touch "$conf"; sed -i "/^$key=/d" "$conf"
+      elif [[ "$val2" == off ]]; then setc "$key" off
+      elif valid_range "$val2" && (( $(hm_to_min "${val2%-*}") < $(hm_to_min "${val2#*-}") )); then setc "$key" "$val2"
+      else echo "usage: hydrate set day mon..sun off|default|HH:MM-HH:MM (start before end)"; return 1; fi ;;
+    quiet)
+      if [[ "$val" == off || -z "$val" ]]; then setc QUIET ""
+      else
+        IFS=, read -ra parts <<< "$val"
+        for part in "${parts[@]}"; do valid_range "$part" || { echo "usage: hydrate set quiet off|HH:MM-HH:MM[,HH:MM-HH:MM...]"; return 1; }; done
+        setc QUIET "$val"
+      fi ;;
+    skip)
       case "$val" in
-        200|250|300|350|400) setc GLASS_ML "$val" ;;
-        *) echo "glass size must be 200, 250, 300, 350, or 400 ml"; exit 1 ;;
+        locked|dnd|fullscreen)
+          case "$val2" in on) v=1 ;; off) v=0 ;; *) echo "usage: hydrate set skip locked|dnd|fullscreen on|off"; return 1 ;; esac
+          setc "SKIP_${val^^}" "$v" ;;
+        idle)
+          if [[ "$val2" == off ]]; then setc SKIP_IDLE_MIN 0
+          elif [[ "$val2" =~ ^[0-9]+$ ]] && (( val2 >= 1 && val2 <= 240 )); then setc SKIP_IDLE_MIN "$val2"
+          else echo "usage: hydrate set skip idle off|MINUTES"; return 1; fi ;;
+        *) echo "usage: hydrate set skip locked|dnd|fullscreen on|off | idle off|MINUTES"; return 1 ;;
       esac ;;
-    *) echo "usage: hydrate set {interval|start|end|start_minute|end_minute|goal|glass} N | days all|weekdays"; exit 1 ;;
+    interval|start|end|start_minute|end_minute|goal|glass|snooze)
+      [[ "$val" =~ ^[0-9]+$ ]] || { echo "number needed"; return 1; }
+      case "$key" in
+        interval)
+          case "$val" in 30|45|60|90) setc INTERVAL "$val"; sched "$val" ;;
+            *) echo "interval must be 30, 45, 60 or 90 minutes"; return 1 ;;
+          esac ;;
+        snooze)
+          case "$val" in 5|10|15|20|30) setc SNOOZE_MIN "$val" ;;
+            *) echo "snooze must be 5, 10, 15, 20 or 30 minutes"; return 1 ;;
+          esac ;;
+        start)    setc START_HOUR "$val" ;;
+        end)      setc END_HOUR "$val" ;;
+        start_minute|end_minute)
+          [[ "$val" == 0 || "$val" == 15 || "$val" == 30 || "$val" == 45 ]] || { echo "minutes must be 0, 15, 30, or 45"; return 1; }
+          [[ "$key" == start_minute ]] && setc START_MINUTE "$val" || setc END_MINUTE "$val" ;;
+        goal)
+          case "$val" in 2000|2500|3000|3500|4000|4500|5000|5500|6000) setc GOAL_ML "$val" ;;
+            *) echo "daily goal must be between 2 and 6 litres (2000 through 6000 ml in 500 ml steps)"; return 1 ;;
+          esac ;;
+        glass)
+          case "$val" in
+            200|250|300|350|400) setc GLASS_ML "$val" ;;
+            *) echo "glass size must be 200, 250, 300, 350, or 400 ml"; return 1 ;;
+          esac ;;
+      esac ;;
+    *)
+      echo "usage: hydrate set {interval|snooze|start|end|start_minute|end_minute|goal|glass} N"
+      echo "       hydrate set days all|weekdays"
+      echo "       hydrate set day mon..sun off|default|HH:MM-HH:MM"
+      echo "       hydrate set quiet off|HH:MM-HH:MM[,HH:MM-HH:MM...]"
+      echo "       hydrate set skip locked|dnd|fullscreen on|off | idle off|MINUTES"
+      return 1 ;;
   esac
   bar
 }
@@ -119,32 +280,56 @@ alert() {
   if [[ "$style" == notify ]]; then
     read -r out < <(notify-send -a Hydrate -u critical -t 0 --wait --action="default=I drank water"           "🥤 Time to drink water" "$msg. Click to log ${GLASS_ML} ml")
   elif command -v yad >/dev/null 2>&1; then
-    yad --title="Hydrate" --class=hydrate --on-top --sticky --skip-taskbar --center --borders=18         --text-align=center --text="<big><b>🥤 Time to drink water</b></big>\n\n$msg"         --button="I drank water (${GLASS_ML} ml):0" --button="Snooze 10 min:1" && out=default
+    yad --title="Hydrate" --class=hydrate --on-top --sticky --skip-taskbar --center --borders=18         --text-align=center --text="<big><b>🥤 Time to drink water</b></big>\n\n$msg"         --button="I drank water (${GLASS_ML} ml):0" --button="Snooze ${SNOOZE_MIN} min:1" && out=default
   else
     notify-send -u critical "🥤 Time to drink water" "$msg" 2>/dev/null || true
   fi
-  if [[ "${out:-}" == *default* ]]; then log; else sched 10; bar; fi
+  if [[ "${out:-}" == *default* ]]; then log; else sched "$SNOOZE_MIN"; bar; fi
 }
 
 tick() {
   exec 9>"$st/lock"; flock -n 9 || exit 0
   (( PAUSED == 1 )) && exit 0
-  weekday_off && exit 0
-  local now_min=$((10#$(date +%H) * 60 + 10#$(date +%M)))
-  local start_min=$((10#$START_HOUR * 60 + 10#${START_MINUTE:-0}))
-  local end_min=$((10#$END_HOUR * 60 + 10#${END_MINUTE:-0}))
+  local win now_min start_min end_min
+  win=$(day_window); [[ "$win" == off ]] && exit 0
+  read -r start_min end_min <<< "$win"
+  now_min=$((10#$(date +%H) * 60 + 10#$(date +%M)))
   (( now_min < start_min || now_min >= end_min )) && exit 0
+  in_quiet "$now_min" && exit 0
   (( $(count) >= GOAL_ML )) && exit 0
   [[ -f "$next" ]] || { sched; exit 0; }
-  (( $(date +%s) >= $(cat "$next") )) && alert
+  (( $(date +%s) >= $(cat "$next") )) || exit 0
+  skip_reason >/dev/null && exit 0      # due, but held back until the reason is gone
+  alert
+}
+
+# 1/0 for each weekday (mon..sun): are reminders off that day
+dayoff_list() {
+  local i out=""
+  for i in 0 1 2 3 4 5 6; do
+    [[ "$(day_window "$i")" == off ]] && out+="${out:+,}1" || out+="${out:+,}0"
+  done
+  echo "$out"
 }
 
 state() {
-  local off=0
+  local off=0 custom=0
   weekday_off && off=1
-  printf '{"ml":%s,"goal":%s,"glass":%s,"interval":%s,"start":%s,"end":%s,"start_minute":%s,"end_minute":%s,"paused":%s,"days":"%s","off":%s,"next":"%s","today":%s,"week":[%s],"prev_avg":%s}\n' \
-    "$(count)" "$GOAL_ML" "$GLASS_ML" "$INTERVAL" "$((10#$START_HOUR))" "$((10#$END_HOUR))" "$((10#${START_MINUTE:-0}))" "$((10#${END_MINUTE:-0}))" "$PAUSED" "$DAYS" "$off" \
-    "$([[ -f "$next" ]] && clock "$(cat "$next")")" "$(( $(date +%u) - 1 ))" "$(week_vals)" "$(prev_avg)"
+  [[ -n "${QUIET:-}${DAY_MON}${DAY_TUE}${DAY_WED}${DAY_THU}${DAY_FRI}${DAY_SAT}${DAY_SUN}" ]] && custom=1
+  printf '{"ml":%s,"goal":%s,"glass":%s,"interval":%s,"snooze":%s,"start":%s,"end":%s,"start_minute":%s,"end_minute":%s,"paused":%s,"days":"%s","custom":%s,"off":%s,"next":"%s","today":%s,"week":[%s],"dayoff":[%s],"prev_avg":%s,"min_offset":%s}\n' \
+    "$(count)" "$GOAL_ML" "$GLASS_ML" "$INTERVAL" "$SNOOZE_MIN" "$((10#$START_HOUR))" "$((10#$END_HOUR))" "$((10#${START_MINUTE:-0}))" "$((10#${END_MINUTE:-0}))" "$PAUSED" "$DAYS" "$custom" "$off" \
+    "$([[ -f "$next" ]] && clock "$(cat "$next")")" "$(( $(date +%u) - 1 ))" "$(week_vals 0)" "$(dayoff_list)" "$(prev_avg)" "$(( -$(max_back) ))"
+}
+
+# hydrate week [OFFSET]   offset 0 = this week, -1 = last week, ...
+week_cmd() {
+  local off="${1:-0}" back mb
+  [[ "$off" =~ ^-?[0-9]+$ ]] || { echo "usage: hydrate week [OFFSET]   (0 = this week, -1 = last week)"; return 1; }
+  back=$(( off < 0 ? -off : 0 ))
+  mb=$(max_back)
+  printf '{"offset":%s,"start":"%s","week":[%s],"avg":%s,"prev_avg":%s,"min_offset":%s,"today":%s}\n' \
+    "$(( -back ))" "$(week_start "$back")" "$(week_vals "$back")" "$(week_avg "$back")" "$(week_avg $((back + 1)))" "$(( -mb ))" \
+    "$(( back == 0 ? $(date +%u) - 1 : -1 ))"
 }
 
 wb() {
@@ -156,23 +341,105 @@ wb() {
   (( PAUSED == 1 )) && cls="paused"
   txt="🥤 $(litres "$ml")/$(litres "$GOAL_ML") L"; (( PAUSED == 1 )) && txt+=" ⏸"
   tip="Water today: $(litres "$ml") of $(litres "$GOAL_ML") L"
-  if weekday_off; then tip+="\nReminders off today (weekdays only)"
+  if weekday_off; then tip+="\nReminders off today"
   elif [[ -f "$next" ]]; then tip+="\nNext reminder: $(clock "$(cat "$next")")"; fi
   tip+="\nEvery $INTERVAL min, $(hour12 "$START_HOUR" "${START_MINUTE:-0}") to $(hour12 "$END_HOUR" "${END_MINUTE:-0}")"
   printf '{"text":"%s","tooltip":"%s","class":"%s","percentage":%s}\n' "$txt" "$tip" "$cls" "$pct"
 }
 
+# hydrate stats [OFFSET]   one line per day for that week, plus the average of the week before it
 stats() {
-  local names=(Mon Tue Wed Thu Fri Sat Sun) vals i n=7 v avg
-  IFS=, read -ra vals <<< "$(week_vals)"
-  [[ "$DAYS" == weekdays ]] && n=5
-  for (( i = 0; i < n; i++ )); do
+  local back=0 names=(Mon Tue Wed Thu Fri Sat Sun) vals i v avg label
+  [[ "${1:-0}" =~ ^-?[0-9]+$ ]] || { echo "usage: hydrate stats [OFFSET]"; return 1; }
+  (( ${1:-0} < 0 )) && back=$(( -${1} ))
+  IFS=, read -ra vals <<< "$(week_vals "$back")"
+  echo "Week of $(week_start "$back")"
+  for (( i = 0; i < 7; i++ )); do
     v=${vals[$i]}
     if (( v < 0 )); then printf '%s  -\n' "${names[$i]}"
     else printf '%s  %s / %s L\n' "${names[$i]}" "$(litres "$v")" "$(litres "$GOAL_ML")"; fi
   done
-  avg=$(prev_avg)
-  if (( avg >= 0 )); then echo "Last week avg  $(litres "$avg") L"; else echo "Last week avg  -"; fi
+  avg=$(week_avg "$back");        label="Week avg"
+  if (( avg >= 0 )); then echo "$label  $(litres "$avg") L"; else echo "$label  -"; fi
+  avg=$(week_avg $((back + 1)));  label="Previous week avg"
+  if (( avg >= 0 )); then echo "$label  $(litres "$avg") L"; else echo "$label  -"; fi
+}
+
+# hydrate entries [DATE|--all]   the individual drinks of a day (today by default)
+print_day() {
+  local d="$1" total ts amt
+  total=$(cat "$st/$d.ml" 2>/dev/null || echo 0)
+  echo "$d  $(litres "$total") L"
+  if [[ -s "$st/$d.log" ]]; then
+    while IFS=$'\t' read -r ts amt; do printf '  %s  +%s ml\n' "$(date -d "@$ts" +%H:%M)" "$amt"; done < "$st/$d.log"
+  else
+    echo "  (no individual entries)"
+  fi
+}
+entries_cmd() {
+  local arg="${1:-today}" f d
+  if [[ "$arg" == --all ]]; then
+    for f in $(ls "$st" 2>/dev/null | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}\.log$' | sort -r | head -30); do print_day "${f%.log}"; done
+    return
+  fi
+  d=$(date -d "$arg" +%F 2>/dev/null) || { echo "usage: hydrate entries [DATE|--all]   e.g. yesterday, 2026-11-05"; return 1; }
+  print_day "$d"
+}
+
+# hydrate schedule   what applies on each day
+schedule_cmd() {
+  local names=(Mon Tue Wed Thu Fri Sat Sun) i w s e
+  for (( i = 0; i < 7; i++ )); do
+    w=$(day_window "$i")
+    if [[ "$w" == off ]]; then printf '%s  off\n' "${names[$i]}"
+    else read -r s e <<< "$w"; printf '%s  %s to %s\n' "${names[$i]}" "$(hour12 $((s / 60)) $((s % 60)))" "$(hour12 $((e / 60)) $((e % 60)))"; fi
+  done
+  echo "every ${INTERVAL} min, snooze ${SNOOZE_MIN} min, quiet: ${QUIET:-none}"
+  echo "skip: locked=$SKIP_LOCKED dnd=$SKIP_DND fullscreen=$SKIP_FULLSCREEN idle=$([[ $SKIP_IDLE_MIN == 0 ]] && echo off || echo "${SKIP_IDLE_MIN} min")"
+}
+
+# hydrate export [FILE]   csv of every drink (days without entries get one row with the day's total)
+export_cmd() {
+  local out="${1:-/dev/stdout}" f d ts amt
+  {
+    echo "date,time,ml"
+    for f in $(ls "$st" 2>/dev/null | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}\.ml$' | sort); do
+      d="${f%.ml}"
+      if [[ -s "$st/$d.log" ]]; then
+        while IFS=$'\t' read -r ts amt; do echo "$d,$(date -d "@$ts" +%H:%M:%S),$amt"; done < "$st/$d.log"
+      else
+        echo "$d,,$(cat "$st/$f")"
+      fi
+    done
+  } > "$out"
+  [[ "$out" == /dev/stdout ]] || echo "exported to $out"
+}
+
+# hydrate backup [FILE] / restore FILE   settings + history in one archive
+backup_cmd() {
+  local f="${1:-$HOME/hydrate-backup-$(date +%F).tar.gz}"
+  tar -czf "$f" "$HOME/.config/hydrate" "$st" 2>/dev/null && echo "backup written to $f"
+}
+restore_cmd() {
+  [[ -f "${1:-}" ]] || { echo "usage: hydrate restore FILE"; return 1; }
+  tar -xzf "$1" -C / && bar && echo "restored from $1"
+}
+
+# hydrate update   pull the source folder this was installed from and reinstall
+update_cmd() {
+  local src flags
+  src=$(cat "$HOME/.config/hydrate/source" 2>/dev/null)
+  if [[ ! -x "$src/install.sh" ]]; then
+    echo "No install folder recorded. Get the new version and run its ./install.sh."; return 1
+  fi
+  if [[ -d "$src/.git" ]] && command -v git >/dev/null 2>&1; then
+    git -C "$src" pull --ff-only || { echo "update failed (local changes?)"; return 1; }
+  else
+    echo "$src is not a git checkout: reinstalling whatever is in that folder."
+  fi
+  flags=$(cat "$HOME/.config/hydrate/install-flags" 2>/dev/null)
+  # shellcheck disable=SC2086
+  exec "$src/install.sh" $flags
 }
 
 opts() {
@@ -194,11 +461,11 @@ yadpanel() {
     bar=""; for i in 0 1 2 3 4 5 6 7 8 9; do (( i < pct / 10 )) && bar+="▰" || bar+="▱"; done
     t="Reminders on"
     [[ -f "$next" ]] && t="Next reminder $(clock "$(cat "$next")")"
-    weekday_off && t="Weekend: reminders off"
+    weekday_off && t="Reminders off today"
     (( PAUSED == 1 )) && t="Paused"
     (( ml >= GOAL_ML )) && t="Goal reached"
     dl="^Every day!Weekdays only"; [[ "$DAYS" == weekdays ]] && dl="Every day!^Weekdays only"
-    out=$(yad --title="Hydrate" --class=hydrate --name=hydrate --on-top --skip-taskbar --fixed         --width=360 --borders=16 --text-align=center         --text="<span size='xx-large'><b>$(litres "$ml") L</b></span>\n<span alpha='70%'>of $(litres "$GOAL_ML") L  ·  $pct%</span>\n\n<span size='large'>$bar</span>\n<span alpha='70%'>$t</span>"         --form --columns=1         --field="Remind every (min):CB" "$(opts "$INTERVAL" echo 30 45 60)"         --field="Start at:CB"           "$(opts "$((10#$START_HOUR))" hour12 5 6 7 8 9 10 11)"         --field="Stop at:CB"            "$(opts "$((10#$END_HOUR))" hour12 17 18 19 20 21 22 23)"         --field="Reminder days:CB"       "$dl"         --field="Glass size (ml):CB"    "$(opts "$GLASS_ML" echo 200 250 300 350 400)"         --field="Daily goal (L):CB"     "$(opts "$GOAL_ML" litres 2000 2500 3000 3500 4000 4500 5000 5500 6000)"         --button="+ ${GLASS_ML} ml:10" --button="Undo:11"         --button="$( (( PAUSED == 1 )) && echo "Resume" || echo "Pause" ):12"         --button="Save:0" --button="Close:1")
+    out=$(yad --title="Hydrate" --class=hydrate --name=hydrate --on-top --skip-taskbar --fixed         --width=360 --borders=16 --text-align=center         --text="<span size='xx-large'><b>$(litres "$ml") L</b></span>\n<span alpha='70%'>of $(litres "$GOAL_ML") L  ·  $pct%</span>\n\n<span size='large'>$bar</span>\n<span alpha='70%'>$t</span>"         --form --columns=1         --field="Remind every (min):CB" "$(opts "$INTERVAL" echo 30 45 60 90)"         --field="Start at:CB"           "$(opts "$((10#$START_HOUR))" hour12 5 6 7 8 9 10 11)"         --field="Stop at:CB"            "$(opts "$((10#$END_HOUR))" hour12 17 18 19 20 21 22 23)"         --field="Reminder days:CB"       "$dl"         --field="Glass size (ml):CB"    "$(opts "$GLASS_ML" echo 200 250 300 350 400)"         --field="Daily goal (L):CB"     "$(opts "$GOAL_ML" litres 2000 2500 3000 3500 4000 4500 5000 5500 6000)"         --button="+ ${GLASS_ML} ml:10" --button="Undo:11"         --button="$( (( PAUSED == 1 )) && echo "Resume" || echo "Pause" ):12"         --button="Save:0" --button="Close:1")
     rc=$?
     case $rc in
       10) log ;;
@@ -235,12 +502,12 @@ menu() {
   case "$c" in
     Log*)      log ;;
     Undo)      undo ;;
-    Interval*) v=$(printf '%s\n' 15 20 30 45 60 90 | pick "Every (min)") && cfg interval "$v" ;;
+    Interval*) v=$(printf '%s\n' 30 45 60 90 | pick "Every (min)") && cfg interval "$v" ;;
     Start*)    v=$(for h in 5 6 7 8 9 10 11; do hour12 "$h"; done | pick "Start") && cfg start "$(to24 "$v")" ;;
     Stop*)     v=$(for h in 17 18 19 20 21 22 23; do hour12 "$h"; done | pick "Stop") && cfg end "$(to24 "$v")" ;;
     Days*)     v=$(printf '%s\n' "Every day" "Weekdays only" | pick "Remind on") && { [[ "$v" == "Weekdays only" ]] && cfg days weekdays || cfg days all; } ;;
-    Glass*)    v=$(printf '%s\n' 200 250 300 500 | pick "Glass (ml)") && cfg glass "$v" ;;
-    Daily*)    v=$(printf '%s\n' 1.5 2 2.5 3 3.5 4 | pick "Goal (L)") && cfg goal "$(awk -v g="$v" 'BEGIN{printf "%d", g * 1000}')" ;;
+    Glass*)    v=$(printf '%s\n' 200 250 300 350 400 | pick "Glass (ml)") && cfg glass "$v" ;;
+    Daily*)    v=$(printf '%s\n' 2 2.5 3 3.5 4 4.5 5 5.5 6 | pick "Goal (L)") && cfg goal "$(awk -v g="$v" 'BEGIN{printf "%d", g * 1000}')" ;;
     Pause*)    toggle ;;
     This*)     notify-send Hydrate "$(stats)" ;;
     Test*)     alert ;;
@@ -255,14 +522,14 @@ remove_all() {
   rm -f "$HOME"/.config/systemd/user/hydrate.{service,timer} "$HOME/.config/autostart/hydrate.desktop" "$HOME/.local/share/applications/hydrate.desktop"
   systemctl --user daemon-reload 2>/dev/null
 
-  for id in hydrate local.hydrate hydrate; do
+  for id in hydrate local.hydrate; do
     command -v omarchy >/dev/null 2>&1 && omarchy plugin disable "$id" >/dev/null 2>&1
     rm -rf "$HOME/.config/omarchy/plugins/$id"
   done
-  if [[ -f "$shj" ]] && command -v jq >/dev/null 2>&1 && grep -qE '"((local)\.)?hydrate"' "$shj"; then
+  if [[ -f "$shj" ]] && command -v jq >/dev/null 2>&1 && grep -qE '"(local\.)?hydrate"' "$shj"; then
     cp "$shj" "$shj.hydrate.bak"
     tmp=$(mktemp)
-    if jq 'if .bar.layout then .bar.layout |= with_entries(.value |= (if type=="array" then map(select(.id != "hydrate" and .id != "local.hydrate" and .id != "hydrate")) else . end)) else . end' \
+    if jq 'if .bar.layout then .bar.layout |= with_entries(.value |= (if type=="array" then map(select(.id != "hydrate" and .id != "local.hydrate")) else . end)) else . end' \
          "$shj.hydrate.bak" > "$tmp" && jq -e . "$tmp" >/dev/null; then
       mv "$tmp" "$shj"
     else
@@ -297,7 +564,8 @@ doctor() {
   echo "systemd timer   : $(systemctl --user is-active hydrate.timer 2>/dev/null || echo inactive)"
   echo "omarchy plugin  : $([[ -d "$HOME/.config/omarchy/plugins/hydrate" ]] && echo installed || echo 'not installed')"
   echo "waybar running  : $(pgrep -x waybar >/dev/null 2>&1 && echo yes || echo no)"
-  echo "alert style     : $ALERT_STYLE    reminder days: $DAYS"
+  echo "alert style     : $ALERT_STYLE    reminder days: $DAYS    version: $VERSION"
+  echo "holding back now: $(skip_reason || echo nothing)"
   for c in notify-send jq flock pkill yad waybar; do
     printf '%-16s: %s\n' "$c" "$(command -v "$c" >/dev/null 2>&1 && echo ok || echo missing)"
   done
@@ -311,23 +579,47 @@ panel() {
   if command -v yad >/dev/null 2>&1; then yadpanel; else menu; fi
 }
 
+# --yes / -y skips the questions of uninstall and purge
+confirm_remove() {
+  local mode="$1" ans days
+  [[ "${2:-}" == --yes || "${2:-}" == -y ]] && return 0
+  if [[ ! -t 0 ]]; then echo "Not running in a terminal: add --yes to $mode without asking."; return 1; fi
+  if [[ "$mode" == purge ]]; then
+    days=$(ls "$st" 2>/dev/null | grep -cE '^[0-9]{4}-[0-9]{2}-[0-9]{2}\.ml$')
+    echo "This permanently deletes your settings and $days day(s) of history ($HOME/.config/hydrate and $st)."
+    read -r -p "Type 'purge' to continue: " ans
+    [[ "$ans" == purge ]]
+  else
+    read -r -p "Remove Hydrate? Your settings and history are kept. [y/N] " ans
+    [[ "$ans" == y || "$ans" == Y || "$ans" == yes ]]
+  fi
+}
+
 case "${1:-status}" in
   tick)       tick; exit 0 ;;
   daemon)     while sleep 60; do "$0" tick; done ;;
   alert)      alert ;;
-  log)        log ;;
+  log)        log "${2:-}"; exit $? ;;
   undo)       undo ;;
-  reset)      echo 0 > "$today"; bar ;;
-  set)        cfg "${2:-}" "${3:-}" ;;
+  reset)      locked reset_day; bar ;;
+  set)        cfg "${2:-}" "${3:-}" "${4:-}"; exit $? ;;
   state)      state ;;
+  week)       week_cmd "${2:-0}"; exit $? ;;
   waybar)     wb ;;
   status)     echo "🥤 $(litres "$(count)")/$(litres "$GOAL_ML") L" ;;
   panel|menu) panel ;;
-  stats)      stats ;;
+  stats)      stats "${2:-0}"; exit $? ;;
+  entries)    entries_cmd "${2:-}"; exit $? ;;
+  schedule)   schedule_cmd ;;
+  export)     export_cmd "${2:-}" ;;
+  backup)     backup_cmd "${2:-}" ;;
+  restore)    restore_cmd "${2:-}"; exit $? ;;
   pause)      setc PAUSED 1; bar ;;
   resume)     setc PAUSED 0; sched; bar ;;
+  update)     update_cmd; exit $? ;;
+  version|--version|-v) echo "hydrate $VERSION" ;;
   doctor)     doctor ;;
-  uninstall)  remove_all; exit 0 ;;
-  purge)      remove_all purge; exit 0 ;;
-  *) echo "usage: hydrate {tick|daemon|alert|log|undo|reset|set|state|status|waybar|panel|stats|pause|resume|doctor|uninstall|purge}"; exit 1 ;;
+  uninstall)  confirm_remove uninstall "${2:-}" || { echo "Cancelled."; exit 1; }; remove_all; exit 0 ;;
+  purge)      confirm_remove purge "${2:-}" || { echo "Cancelled."; exit 1; }; remove_all purge; exit 0 ;;
+  *) echo "usage: hydrate {panel|log [ML]|undo|pause|resume|status|stats [OFFSET]|week [OFFSET]|entries [DATE|--all]|schedule|set ...|export [FILE]|backup [FILE]|restore FILE|update|version|doctor|uninstall [--yes]|purge [--yes]}"; exit 1 ;;
 esac

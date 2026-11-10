@@ -13,6 +13,7 @@ BarWidget {
   property var st: ({ ml: 0, goal: 2500, glass: 250, interval: 45, start: 8, start_minute: 0, end: 22, end_minute: 0, paused: 0, off: 0, days: "all", next: "", today: 0, week: [], prev_avg: -1 })
   property var queue: []
   property bool again: false
+  property var weekData: null
   readonly property real frac: Math.min(1, (st.ml || 0) / Math.max(1, st.goal || 1))
   readonly property string label: litres(st.ml) + "/" + litres(st.goal) + " L" + (st.paused === 1 ? " · paused" : "")
 
@@ -20,6 +21,11 @@ BarWidget {
   readonly property bool popoutSwitchClosing: panelLoader.item ? panelLoader.item.popoutSwitchClosing === true : false
 
   function litres(ml) { return parseFloat((ml / 1000).toFixed(2)).toString() }
+  // history for another week, fetched when the panel scrolls to it
+  function loadWeek(offset) {
+    weekReader.command = [cli, "week", String(offset)]
+    weekReader.running = true
+  }
   function refresh() { if (reader.running) again = true; else reader.running = true }
   function step() { runner.command = [cli].concat(queue.shift()); runner.running = true }
   function act(args) { queue.push(args); if (!runner.running) step() }
@@ -43,6 +49,13 @@ BarWidget {
       onStreamFinished: { try { root.st = JSON.parse(text) } catch (e) {} }
     }
     onExited: { if (root.again) { root.again = false; reader.running = true } }
+  }
+
+  Process {
+    id: weekReader
+    stdout: StdioCollector {
+      onStreamFinished: { try { root.weekData = JSON.parse(text) } catch (e) {} }
+    }
   }
 
   Process {
